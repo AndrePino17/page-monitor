@@ -35,8 +35,17 @@ def save_json(path, data):
 def fetch(url: str) -> str:
     r = requests.get(
         url,
-        headers={"User-Agent": UA, "Accept-Language": "it-IT,it;q=0.9,en;q=0.8"},
+        headers={
+            "User-Agent": UA,
+            "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
         timeout=30
+    )
+    r.raise_for_status()
+    return r.text
+
     )
     r.raise_for_status()
     return r.text
