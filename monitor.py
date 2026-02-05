@@ -20,6 +20,10 @@ UA = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
+# Se in un singolo run "cambiano" tante pagine, quasi sempre è rumore/inizializzazione:
+# aggiorniamo lo state ma NON notifichiamo.
+ANTI_SPAM_THRESHOLD = 2  # 2 o più cambiamenti nello stesso run => niente notifiche
+
 def load_json(path: str, default):
     p = Path(path)
     if not p.exists():
@@ -41,93 +45,107 @@ def normalize_text(s: str) -> str:
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram non configurato (mancano env).")
+        print("Telegram non configurato (mancano TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
         return
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "disable_web_page_preview": False,
     }
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=25)
     r.raise_for_status()
 
 def try_click_cookie(page):
-    # prova a chiudere popup cookie / privacy se compare
     candidates = [
+        "button:has-text('Accetta')",
+        "button:has-text('Accetto')",
+        "button:has-text('Accept')",
+        "button:has-text('I agree')",
         "text=Accetta",
         "text=Accetto",
-        "text=I agree",
         "text=Accept",
-        "text=Accetta tutto",
-        "text=Accept all",
-        "text=OK",
-        "button:has-text('Accetta')",
-        "button:has-text('Accept')",
+        "text=I agree",
     ]
     for sel in candidates:
         try:
-            page.locator(sel).first.click(timeout=1200)
+            page.locator(sel).first.click(timeout=1500)
             print("Cookie popup chiuso.")
             return
         except Exception:
             pass
 
-def extract_latest_comment_signature(page) -> str:
+def extract_stable_signature(page) -> str:
     """
-    Estrae una 'firma' (signature) del commento più recente.
-    Se non riesce a trovare una card commento, fa fallback su una porzione di testo della pagina
-    (meno preciso, ma evita di rompere tutto).
+    Estrae una firma (hash) più stabile possibile del commento più recente.
+    Non può essere perfetta perché Investing cambia HTML spesso, ma:
+    - prova più selettori "comment-like"
+    - prende il primo blocco di testo plausibile
+    - fa hash solo di quel blocco, NON di tutta la pagina (meno falsi positivi)
     """
-    # Prova selettori comuni (può cambiare nel tempo: ne mettiamo tanti)
+
+    # Selettori euristici: proviamo a trovare elementi che contengono commenti
     selectors = [
         "[data-test*='comment']",
         "[class*='comment']",
         "article",
-        "div:has-text('Commenti')",
+        "div[class*='text']",
+        "div[class*='content']",
     ]
 
-    # 1) Prova a trovare blocchi che sembrano commenti e prendere il primo
+    best = None
+
     for sel in selectors:
         try:
             loc = page.locator(sel)
-            count = loc.count()
-            if count <= 0:
+            n = loc.count()
+            if n <= 0:
                 continue
 
-            # prendiamo i primi elementi e cerchiamo testo "plausibile"
-            for i in range(min(count, 15)):
-                txt = loc.nth(i).inner_text(timeout=1000)
+            # controlliamo i primi elementi: il commento più recente di solito sta in alto
+            for i in range(min(n, 20)):
+                txt = loc.nth(i).inner_text(timeout=1500)
                 txt = normalize_text(txt)
-                # euristica: un commento di solito ha un minimo di lunghezza
-                if 30 <= len(txt) <= 2000:
-                    return sha256(txt)
+
+                # euristiche per evitare header/menu
+                if len(txt) < 40:
+                    continue
+                if len(txt) > 2500:
+                    continue
+                if "Accedi" in txt and "Registrati" in txt and len(txt) < 200:
+                    continue
+
+                best = txt
+                break
+
+            if best:
+                break
         except Exception:
             continue
 
-    # 2) Fallback: usa una parte del testo principale (meno preciso)
-    try:
-        body_txt = page.locator("body").inner_text(timeout=2000)
-        body_txt = normalize_text(body_txt)
-        # prendiamo solo una finestra (per ridurre rumore)
-        window = body_txt[:4000]
-        return sha256(window)
-    except Exception:
-        # ultimo fallback
-        html = page.content()
-        return sha256(html[:4000])
+    if not best:
+        # fallback: prendi un pezzo del body (ma limitato, non tutta la pagina)
+        try:
+            body = normalize_text(page.locator("body").inner_text(timeout=2000))
+            best = body[:2000]
+        except Exception:
+            best = page.content()[:2000]
+
+    return sha256(best)
 
 def main():
     targets = load_json(TARGETS_FILE, [])
     state = load_json(STATE_FILE, {})
     new_state = dict(state)
 
-    first_run = (len(state) == 0)
+    # Per evitare spam iniziale: se state è vuoto, NON notifichiamo nulla
+    first_global_run = (len(state) == 0)
 
     if not targets:
-        print("targets.json vuoto: niente da fare.")
+        print("targets.json vuoto: niente da controllare.")
         return
+
+    changes = []  # lista di (name, url) che risultano cambiati in questo run
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -140,12 +158,12 @@ def main():
 
         for t in targets:
             name = t.get("name", "Senza nome")
-            url = t.get("url")
+            url = t.get("url", "").strip()
             if not url:
                 continue
 
-            # Qui la tua richiesta: SOLO Investing
-            if "it.investing.com/members/" not in url:
+            # SOLO investing members comments
+            if "it.investing.com/members/" not in url or "/comments" not in url:
                 print(f"Skip non-investing: {url}")
                 continue
 
@@ -155,13 +173,13 @@ def main():
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 try_click_cookie(page)
 
-                # aspetta un attimo che carichi contenuti dinamici
+                # non aspettiamo networkidle (Investing non sta mai fermo); massimo un attimo
                 try:
-                    page.wait_for_load_state("networkidle", timeout=15000)
-                except PWTimeoutError:
+                    page.wait_for_timeout(1500)
+                except Exception:
                     pass
 
-                sig = extract_latest_comment_signature(page)
+                sig = extract_stable_signature(page)
                 old = state.get(url)
 
                 if old is None:
@@ -170,15 +188,9 @@ def main():
                     continue
 
                 if sig != old:
-                    print("CAMBIAMENTO RILEVATO (nuovo commento / contenuto).")
-                    msg = (
-                        f"🔔 Nuovo commento rilevato\n"
-                        f"📄 {name}\n"
-                        f"🔗 {url}\n"
-                        f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-                    )
-                    send_telegram(msg)
+                    print("CAMBIAMENTO rilevato.")
                     new_state[url] = sig
+                    changes.append((name, url))
                 else:
                     print("Nessun cambiamento.")
 
@@ -188,11 +200,26 @@ def main():
         context.close()
         browser.close()
 
-    # salva stato
-    save_json(STATE_FILE, new_state)
+    # --- NOTIFICHE (anti-spam) ---
+    if first_global_run:
+        print("Primo avvio globale: aggiorno state.json senza notifiche.")
+    else:
+        if len(changes) >= ANTI_SPAM_THRESHOLD:
+            print(f"Trovati {len(changes)} cambiamenti nello stesso run: anti-spam -> nessuna notifica.")
+        elif len(changes) == 1:
+            name, url = changes[0]
+            msg = (
+                f"🔔 Nuovo commento rilevato\n"
+                f"📄 {name}\n"
+                f"🔗 {url}\n"
+                f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+            )
+            send_telegram(msg)
+        else:
+            print("0 cambiamenti: nessuna notifica.")
 
-    if first_run:
-        print("Primo avvio globale: salvato state.json (notifiche disattivate per evitare spam).")
+    # salva lo stato aggiornato
+    save_json(STATE_FILE, new_state)
 
 if __name__ == "__main__":
     main()
