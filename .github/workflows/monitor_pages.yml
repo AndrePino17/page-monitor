@@ -5,13 +5,13 @@ on:
 
 permissions:
   contents: write
+concurrency:
+  group: monitor-pages
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    concurrency:
-      group: monitor-pages
-      cancel-in-progress: true
 
     steps:
       - name: Checkout
