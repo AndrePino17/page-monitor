@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright
 
 TARGETS_FILE = "targets.json"
 STATE_FILE = "state.json"
@@ -19,10 +19,6 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
-
-# Se in un singolo run "cambiano" tante pagine, quasi sempre è rumore/inizializzazione:
-# aggiorniamo lo state ma NON notifichiamo.
-ANTI_SPAM_THRESHOLD = 2  # 2 o più cambiamenti nello stesso run => niente notifiche
 
 def load_json(path: str, default):
     p = Path(path)
@@ -40,8 +36,7 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def normalize_text(s: str) -> str:
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -75,16 +70,12 @@ def try_click_cookie(page):
         except Exception:
             pass
 
-def extract_stable_signature(page) -> str:
+def extract_signature(page) -> str:
     """
-    Estrae una firma (hash) più stabile possibile del commento più recente.
-    Non può essere perfetta perché Investing cambia HTML spesso, ma:
-    - prova più selettori "comment-like"
-    - prende il primo blocco di testo plausibile
-    - fa hash solo di quel blocco, NON di tutta la pagina (meno falsi positivi)
+    Firma abbastanza stabile del commento più recente.
+    NON hasha tutta la pagina (che cambia spesso),
+    ma prova a prendere un blocco di testo tipo commento.
     """
-
-    # Selettori euristici: proviamo a trovare elementi che contengono commenti
     selectors = [
         "[data-test*='comment']",
         "[class*='comment']",
@@ -94,7 +85,6 @@ def extract_stable_signature(page) -> str:
     ]
 
     best = None
-
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -102,12 +92,9 @@ def extract_stable_signature(page) -> str:
             if n <= 0:
                 continue
 
-            # controlliamo i primi elementi: il commento più recente di solito sta in alto
             for i in range(min(n, 20)):
-                txt = loc.nth(i).inner_text(timeout=1500)
-                txt = normalize_text(txt)
+                txt = normalize_text(loc.nth(i).inner_text(timeout=1500))
 
-                # euristiche per evitare header/menu
                 if len(txt) < 40:
                     continue
                 if len(txt) > 2500:
@@ -124,7 +111,7 @@ def extract_stable_signature(page) -> str:
             continue
 
     if not best:
-        # fallback: prendi un pezzo del body (ma limitato, non tutta la pagina)
+        # fallback controllato: solo parte del body
         try:
             body = normalize_text(page.locator("body").inner_text(timeout=2000))
             best = body[:2000]
@@ -138,14 +125,9 @@ def main():
     state = load_json(STATE_FILE, {})
     new_state = dict(state)
 
-    # Per evitare spam iniziale: se state è vuoto, NON notifichiamo nulla
-    first_global_run = (len(state) == 0)
-
     if not targets:
         print("targets.json vuoto: niente da controllare.")
         return
-
-    changes = []  # lista di (name, url) che risultano cambiati in questo run
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -158,7 +140,7 @@ def main():
 
         for t in targets:
             name = t.get("name", "Senza nome")
-            url = t.get("url", "").strip()
+            url = (t.get("url") or "").strip()
             if not url:
                 continue
 
@@ -172,14 +154,9 @@ def main():
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 try_click_cookie(page)
+                page.wait_for_timeout(1500)
 
-                # non aspettiamo networkidle (Investing non sta mai fermo); massimo un attimo
-                try:
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    pass
-
-                sig = extract_stable_signature(page)
+                sig = extract_signature(page)
                 old = state.get(url)
 
                 if old is None:
@@ -188,9 +165,15 @@ def main():
                     continue
 
                 if sig != old:
-                    print("CAMBIAMENTO rilevato.")
+                    print("CAMBIAMENTO rilevato -> invio Telegram.")
+                    msg = (
+                        f"🔔 Nuovo commento rilevato\n"
+                        f"📄 {name}\n"
+                        f"🔗 {url}\n"
+                        f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+                    )
+                    send_telegram(msg)
                     new_state[url] = sig
-                    changes.append((name, url))
                 else:
                     print("Nessun cambiamento.")
 
@@ -200,25 +183,6 @@ def main():
         context.close()
         browser.close()
 
-    # --- NOTIFICHE (anti-spam) ---
-    if first_global_run:
-        print("Primo avvio globale: aggiorno state.json senza notifiche.")
-    else:
-        if len(changes) >= ANTI_SPAM_THRESHOLD:
-            print(f"Trovati {len(changes)} cambiamenti nello stesso run: anti-spam -> nessuna notifica.")
-        elif len(changes) == 1:
-            name, url = changes[0]
-            msg = (
-                f"🔔 Nuovo commento rilevato\n"
-                f"📄 {name}\n"
-                f"🔗 {url}\n"
-                f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-            )
-            send_telegram(msg)
-        else:
-            print("0 cambiamenti: nessuna notifica.")
-
-    # salva lo stato aggiornato
     save_json(STATE_FILE, new_state)
 
 if __name__ == "__main__":
