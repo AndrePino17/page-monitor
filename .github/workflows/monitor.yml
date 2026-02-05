@@ -5,14 +5,12 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -20,21 +18,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
 
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python monitor.py
+        run: |
+          python monitor.py
 
       - name: Commit updated state
         run: |
-          if git status --porcelain | grep -q "state.json"; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state.json
-            git commit -m "Update monitor state"
-            git push
-          fi
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add state.json
+          git commit -m "Update state" || echo "No changes"
+          git push
