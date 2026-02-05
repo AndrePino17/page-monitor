@@ -1,11 +1,8 @@
-# schedule enabled
-
 name: Monitor pages
 
 on:
   schedule:
-    - cron: "* * * * *"
-
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -14,6 +11,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    concurrency:
+      group: monitor-pages
+      cancel-in-progress: true
 
     steps:
       - name: Checkout
