@@ -1,8 +1,8 @@
 import json
 import os
-import hashlib
 import re
 import time
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -21,21 +21,14 @@ UA = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
-# Ottimizzazione: carichiamo solo HTML/XHR minimi, blocchiamo immagini/font/media
+# 🚀 ottimizzazione
 BLOCK_RESOURCE_TYPES = {"image", "media", "font"}
-
-# Tempi aggressivi (per non far durare i run 3+ minuti)
-GOTO_TIMEOUT_MS = 45_000
-WAIT_AFTER_LOAD_MS = 1200
-RETRIES_PER_URL = 2
-
-# Se trovo cambiamenti su più pagine nello stesso run:
-# - 0 => manda tutte le notifiche (una per pagina)
-# - 1 => manda un riepilogo unico
-BATCH_MODE = 0
+GOTO_TIMEOUT_MS = 35_000
+WAIT_AFTER_LOAD_MS = 1000
+RETRIES_PER_URL = 1
 
 
-def load_json(path: str, default):
+def load_json(path, default):
     p = Path(path)
     if not p.exists():
         return default
@@ -45,7 +38,7 @@ def load_json(path: str, default):
         return default
 
 
-def save_json(path: str, data):
+def save_json(path, data):
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -54,13 +47,12 @@ def sha256(s: str) -> str:
 
 
 def norm(s: str) -> str:
-    s = re.sub(r"\s+", " ", s or "").strip()
-    return s
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram non configurato (mancano env TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
+        print("Telegram non configurato.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -70,101 +62,66 @@ def send_telegram(text: str):
         "disable_web_page_preview": False,
     }
 
-    last = None
-    for _ in range(3):
-        try:
-            r = requests.post(url, json=payload, timeout=25)
-            r.raise_for_status()
-            return
-        except Exception as e:
-            last = e
-            time.sleep(1.5)
-    raise last
+    r = requests.post(url, json=payload, timeout=20)
+    r.raise_for_status()
 
 
 def try_click_cookie(page):
-    # Non sempre c'è, ma quando c'è rallenta / rompe i selettori
-    candidates = [
+    for sel in [
         "button:has-text('Accetta')",
         "button:has-text('Accetto')",
         "button:has-text('Accept')",
-        "button:has-text('I agree')",
         "text=Accetta",
-        "text=Accetto",
         "text=Accept",
-    ]
-    for sel in candidates:
+    ]:
         try:
-            page.locator(sel).first.click(timeout=1200)
+            page.locator(sel).first.click(timeout=1000)
             return
         except Exception:
             pass
 
 
-def extract_latest_comment_signature(page):
+def extract_first_comment_text(page):
     """
-    Estrae SOLO il commento più recente e crea una firma stabile.
-    Ritorna: (signature, preview)
-    Se non trova niente, ritorna (None, None)
+    PRENDE SOLO IL PRIMO COMMENTO IN ALTO
+    (basato su pagina reale it.investing.com/members/.../comments)
     """
+    header = page.get_by_text("Commenti di", exact=False).first
+    try:
+        header.wait_for(timeout=5000)
+    except Exception:
+        return None
 
-    # Strategie: cerchiamo blocchi che contengono testo "da commento"
-    # NB: Investing cambia classi spesso, quindi usiamo euristiche.
-    selectors = [
-        # blocchi comment-like
-        "[class*='comment']",
-        "[data-test*='comment']",
-        # fallback ragionevole
-        "article",
-        # ultimo fallback (evitiamo body, causa falsi positivi)
-        "div",
-    ]
+    container = header.locator("xpath=ancestor::div[1]")
+    try:
+        text = container.inner_text(timeout=2500)
+    except Exception:
+        return None
 
-    def clean_text(t: str) -> str:
-        t = norm(t)
-        # rimuovi parole UI che cambiano spesso
-        junk = ["Rispondi", "Condividi", "Segnala", "Mi piace", "Reply", "Share", "Report", "Like"]
-        for j in junk:
-            t = t.replace(j, "")
-        return norm(t)
+    text = norm(text)
 
-    best = None
+    # Regex: STRUMENTO + "X ore fa" + TESTO COMMENTO
+    m = re.search(
+        r"Commenti di .*? "
+        r"[A-Za-z0-9À-ÿ\.\-\s]{2,80}\s+"
+        r"\d+\s+(?:minuti|minuto|ore|ora|giorni|giorno)\s+fa\s+"
+        r"(?P<comment>.+?)"
+        r"(?=\s+[A-Za-z0-9À-ÿ\.\-\s]{2,80}\s+\d+\s+(?:minuti|minuto|ore|ora|giorni|giorno)\s+fa|\Z)",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            n = loc.count()
-            if n <= 0:
-                continue
+    if not m:
+        return None
 
-            # Scansioniamo i primi elementi (commenti recenti di solito stanno sopra)
-            for i in range(min(n, 35)):
-                try:
-                    raw = loc.nth(i).inner_text(timeout=1200)
-                except Exception:
-                    continue
+    comment = m.group("comment")
 
-                txt = clean_text(raw)
-                if len(txt) < 40:
-                    continue
-                # filtri anti-menu/login
-                if "Accedi" in txt and "Registrati" in txt and len(txt) < 250:
-                    continue
+    # pulizia UI
+    for junk in ["Rispondi", "Condividi", "Segnala", "Mi piace", "Reply", "Share", "Report", "Like"]:
+        comment = comment.replace(junk, "")
 
-                # Stabilizziamo: prendiamo solo i primi 900 caratteri
-                best = txt[:900]
-                break
-
-            if best:
-                break
-        except Exception:
-            continue
-
-    if not best:
-        return None, None
-
-    preview = best[:260]
-    return sha256(best), preview
+    comment = norm(comment)
+    return comment[:1000]
 
 
 def main():
@@ -173,105 +130,73 @@ def main():
     new_state = dict(state)
 
     if not targets:
-        print("targets.json vuoto: niente da controllare.")
+        print("targets.json vuoto.")
         return
-
-    changes = []  # (name, url, preview)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=UA, locale="it-IT", viewport={"width": 1280, "height": 720})
+        context = browser.new_context(user_agent=UA, locale="it-IT")
 
-        # Blocco risorse pesanti per velocizzare
         def route_handler(route):
-            try:
-                if route.request.resource_type in BLOCK_RESOURCE_TYPES:
-                    return route.abort()
-                return route.continue_()
-            except Exception:
-                return route.continue_()
+            if route.request.resource_type in BLOCK_RESOURCE_TYPES:
+                return route.abort()
+            return route.continue_()
 
         context.route("**/*", route_handler)
         page = context.new_page()
 
         for t in targets:
             name = t.get("name", "Senza nome")
-            url = (t.get("url") or "").strip()
-            if not url:
-                continue
+            url = t.get("url", "").strip()
 
-            # Solo investing members comments
             if "it.investing.com/members/" not in url or "/comments" not in url:
-                print(f"Skip non-investing: {url}")
                 continue
 
-            print(f"\nControllo: {name} -> {url}")
+            print(f"\nControllo: {name}")
 
             old_sig = state.get(url)
+            comment = None
 
-            sig = None
-            preview = None
-            last_err = None
-
-            for attempt in range(RETRIES_PER_URL + 1):
+            for _ in range(RETRIES_PER_URL + 1):
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
                     try_click_cookie(page)
                     page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
 
-                    sig, preview = extract_latest_comment_signature(page)
-                    if not sig:
-                        raise RuntimeError("Non trovo il commento più recente (selettori non matchano).")
-                    last_err = None
-                    break
-                except (PWTimeoutError, Exception) as e:
-                    last_err = e
-                    print(f"  Tentativo {attempt+1}/{RETRIES_PER_URL+1} fallito: {e}")
-                    page.wait_for_timeout(800)
+                    comment = extract_first_comment_text(page)
+                    if comment:
+                        break
+                except PWTimeoutError:
+                    pass
 
-            if last_err is not None and sig is None:
-                # Non aggiorniamo lo state se non leggiamo bene (evita sballo + falsi positivi)
-                print(f"  Errore definitivo: {last_err}")
+            if not comment:
+                print("  impossibile leggere commento (skip)")
                 continue
 
+            sig = sha256(comment)
+
             if old_sig is None:
-                print("  Primo avvio: salvo stato (NO notifica).")
+                print("  primo avvio → salvo stato")
                 new_state[url] = sig
                 continue
 
             if sig != old_sig:
-                print("  CAMBIAMENTO reale: ultimo commento diverso.")
+                print("  🔔 CAMBIAMENTO REALE")
+                msg = (
+                    f"🔔 Nuovo commento\n"
+                    f"📄 {name}\n"
+                    f"🔗 {url}\n"
+                    f"📝 {comment[:300]}\n"
+                    f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+                )
+                send_telegram(msg)
                 new_state[url] = sig
-                changes.append((name, url, preview))
             else:
-                print("  Nessun cambiamento.")
+                print("  nessun cambiamento")
                 new_state[url] = old_sig
 
         context.close()
         browser.close()
-
-    # Notifiche (senza anti-spam che ti azzera tutto)
-    if changes:
-        if BATCH_MODE == 1:
-            # Un solo messaggio riepilogo
-            lines = ["🔔 Nuovi commenti rilevati:"]
-            for name, url, preview in changes:
-                lines.append(f"\n📄 {name}\n🔗 {url}\n📝 {preview}")
-            lines.append(f"\n🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-            send_telegram("\n".join(lines))
-        else:
-            # Una notifica per pagina (come vuoi tu)
-            for name, url, preview in changes:
-                msg = (
-                    f"🔔 Nuovo commento rilevato\n"
-                    f"📄 {name}\n"
-                    f"🔗 {url}\n"
-                    f"📝 {preview}\n"
-                    f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-                )
-                send_telegram(msg)
-    else:
-        print("\nNessun cambiamento in questo run.")
 
     save_json(STATE_FILE, new_state)
 
