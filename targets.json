@@ -1,63 +1,25 @@
 [
-  {
-    "name": "Investing - user 269714067",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/269714067/comments"
-  },
-  {
-    "name": "Investing - user 269730728",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/269730728/comments"
-  },
-  {
-    "name": "Investing - user 274536671",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/274536671/comments"
-  },
-  {
-    "name": "Investing - user 267396923",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/267396923/comments"
-  },
-  {
-    "name": "Investing - user 266854954",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/266854954/comments"
-  },
-  {
-    "name": "Investing - user 266895368",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/266895368/comments"
-  },
-  {
-    "name": "Investing - user 265097315",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/265097315/comments"
-  },
-  {
-    "name": "Investing - user 276292807",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/276292807/comments"
-  },
-  {
-    "name": "Investing - user 269350474",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/269350474/comments"
-  },
-  {
-    "name": "Investing - user 265097269",
-    "type": "investing_member_comments",
-    "url": "https://it.investing.com/members/265097269/comments"
-  },
-  {
-    "name": "Investing - user 262595249",
-    "type": "investing_member_comments",
+
+    "url": "https://it.investing.com/members/269714067/comments",
+
+    "url": "https://it.investing.com/members/269730728/comments",
+
+    "url": "https://it.investing.com/members/274536671/comments",
+
+    "url": "https://it.investing.com/members/267396923/comments",
+
+    "url": "https://it.investing.com/members/266854954/comments",
+
+    "url": "https://it.investing.com/members/266895368/comments",
+
+    "url": "https://it.investing.com/members/265097315/comments",
+
+    "url": "https://it.investing.com/members/276292807/comments",
+
+    "url": "https://it.investing.com/members/269350474/comments",
+
+    "url": "https://it.investing.com/members/265097269/comments",
+    
     "url": "https://it.investing.com/members/262595249/comments"
-  },
-  {
-  "name": "TEST - pagina prova",
-  "type": "full_page_hash",
-  "url": "https://raw.githubusercontent.com/AndrePino17/page-monitor/main/test.html"
-}
 
 ]
