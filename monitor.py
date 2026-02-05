@@ -1,205 +1,140 @@
 import json
 import os
-import re
-import time
 import hashlib
-from datetime import datetime
 from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+STATE_FILE = Path("state.json")
 
-TARGETS_FILE = "targets.json"
-STATE_FILE = "state.json"
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {}
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-
-# 🚀 ottimizzazione
-BLOCK_RESOURCE_TYPES = {"image", "media", "font"}
-GOTO_TIMEOUT_MS = 35_000
-WAIT_AFTER_LOAD_MS = 1000
-RETRIES_PER_URL = 1
-
-
-def load_json(path, default):
-    p = Path(path)
-    if not p.exists():
-        return default
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def save_json(path, data):
-    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-
-def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram non configurato.")
+def telegram_send(text: str):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("⚠️ Telegram env mancanti (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urlencode({
+        "chat_id": chat_id,
         "text": text,
-        "disable_web_page_preview": False,
-    }
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
 
-    r = requests.post(url, json=payload, timeout=20)
-    r.raise_for_status()
+    req = Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urlopen(req, timeout=15) as resp:
+        _ = resp.read()
 
+def normalize_text(s: str) -> str:
+    return " ".join(s.strip().split())
 
-def try_click_cookie(page):
-    for sel in [
-        "button:has-text('Accetta')",
-        "button:has-text('Accetto')",
-        "button:has-text('Accept')",
-        "text=Accetta",
-        "text=Accept",
-    ]:
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+def get_first_comment_text(page) -> str | None:
+    # Selector più “generico” possibile per Investing (commento)
+    # Se Investing cambia HTML, qui è l’unico punto da sistemare.
+    selectors = [
+        ".comment_text",                 # spesso presente
+        "[data-test='comment-text']",     # a volte presente
+        ".js-comment-text",              # fallback
+    ]
+
+    for sel in selectors:
         try:
-            page.locator(sel).first.click(timeout=1000)
-            return
+            page.wait_for_selector(sel, timeout=8000)
+            txt = page.locator(sel).first.inner_text()
+            txt = normalize_text(txt)
+            if txt:
+                return txt
+        except PWTimeout:
+            pass
         except Exception:
             pass
-
-
-def extract_first_comment_text(page):
-    """
-    PRENDE SOLO IL PRIMO COMMENTO IN ALTO
-    (basato su pagina reale it.investing.com/members/.../comments)
-    """
-    header = page.get_by_text("Commenti di", exact=False).first
-    try:
-        header.wait_for(timeout=5000)
-    except Exception:
-        return None
-
-    container = header.locator("xpath=ancestor::div[1]")
-    try:
-        text = container.inner_text(timeout=2500)
-    except Exception:
-        return None
-
-    text = norm(text)
-
-    # Regex: STRUMENTO + "X ore fa" + TESTO COMMENTO
-    m = re.search(
-        r"Commenti di .*? "
-        r"[A-Za-z0-9À-ÿ\.\-\s]{2,80}\s+"
-        r"\d+\s+(?:minuti|minuto|ore|ora|giorni|giorno)\s+fa\s+"
-        r"(?P<comment>.+?)"
-        r"(?=\s+[A-Za-z0-9À-ÿ\.\-\s]{2,80}\s+\d+\s+(?:minuti|minuto|ore|ora|giorni|giorno)\s+fa|\Z)",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    if not m:
-        return None
-
-    comment = m.group("comment")
-
-    # pulizia UI
-    for junk in ["Rispondi", "Condividi", "Segnala", "Mi piace", "Reply", "Share", "Report", "Like"]:
-        comment = comment.replace(junk, "")
-
-    comment = norm(comment)
-    return comment[:1000]
-
+    return None
 
 def main():
-    targets = load_json(TARGETS_FILE, [])
-    state = load_json(STATE_FILE, {})
-    new_state = dict(state)
+    # Metti qui TUTTI i link Investing (comments)
+    URLS = [
+        "https://it.investing.com/members/266854954/comments",
+        # aggiungi gli altri...
+    ]
 
-    if not targets:
-        print("targets.json vuoto.")
-        return
+    state = load_state()
+    changed_urls = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=UA, locale="it-IT")
+        context = browser.new_context(
+            locale="it-IT",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        )
 
-        def route_handler(route):
-            if route.request.resource_type in BLOCK_RESOURCE_TYPES:
+        # blocca risorse pesanti (veloce)
+        def route_filter(route):
+            rt = route.request.resource_type
+            if rt in {"image", "font", "media"}:
                 return route.abort()
             return route.continue_()
 
-        context.route("**/*", route_handler)
+        context.route("**/*", route_filter)
         page = context.new_page()
 
-        for t in targets:
-            name = t.get("name", "Senza nome")
-            url = t.get("url", "").strip()
+        for url in URLS:
+            print(f"Controllo: {url}")
 
-            if "it.investing.com/members/" not in url or "/comments" not in url:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            except PWTimeout:
+                print("  timeout (skip)")
+                continue
+            except Exception:
+                print("  errore caricamento (skip)")
                 continue
 
-            print(f"\nControllo: {name}")
-
-            old_sig = state.get(url)
-            comment = None
-
-            for _ in range(RETRIES_PER_URL + 1):
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-                    try_click_cookie(page)
-                    page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
-
-                    comment = extract_first_comment_text(page)
-                    if comment:
-                        break
-                except PWTimeoutError:
-                    pass
-
-            if not comment:
+            text = get_first_comment_text(page)
+            if not text:
                 print("  impossibile leggere commento (skip)")
                 continue
 
-            sig = sha256(comment)
+            # confronto su contenuto (hash) → niente falsi positivi su “2 ore fa”
+            curr = sha1(text)
+            prev = state.get(url)
 
-            if old_sig is None:
-                print("  primo avvio → salvo stato")
-                new_state[url] = sig
+            if prev is None:
+                # prima volta: salva senza notificare (evita spam iniziale)
+                state[url] = curr
+                print("  prima volta: salvo stato (no notifica)")
                 continue
 
-            if sig != old_sig:
-                print("  🔔 CAMBIAMENTO REALE")
-                msg = (
-                    f"🔔 Nuovo commento\n"
-                    f"📄 {name}\n"
-                    f"🔗 {url}\n"
-                    f"📝 {comment[:300]}\n"
-                    f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
-                )
-                send_telegram(msg)
-                new_state[url] = sig
+            if prev != curr:
+                state[url] = curr
+                changed_urls.append(url)
+                print("  CAMBIAMENTO rilevato.")
             else:
-                print("  nessun cambiamento")
-                new_state[url] = old_sig
+                print("  nessun cambiamento.")
 
-        context.close()
         browser.close()
 
-    save_json(STATE_FILE, new_state)
+    # Notifica: una sola per run (anti-spam), ma contiene TUTTI i link cambiati
+    if changed_urls:
+        msg = "🔔 Cambiamenti rilevati:\n" + "\n".join(changed_urls)
+        telegram_send(msg)
 
+    save_state(state)
 
 if __name__ == "__main__":
     main()
