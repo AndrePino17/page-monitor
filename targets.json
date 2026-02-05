@@ -53,5 +53,11 @@
     "name": "Investing - user 262595249",
     "type": "investing_member_comments",
     "url": "https://it.investing.com/members/262595249/comments"
-  }
+  },
+  {
+  "name": "TEST - pagina prova",
+  "type": "full_page_hash",
+  "url": "https://raw.githubusercontent.com/AndrePino17/page-monitor/main/test.html"
+}
+
 ]
