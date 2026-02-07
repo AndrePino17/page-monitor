@@ -17,10 +17,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 NAV_TIMEOUT_MS = 35_000
 EXTRA_WAIT_MS = 1200
 
-# ⚠️ Se vedi molti 403, metti 1. Se regge, 2-3.
-MAX_CONCURRENCY = 2
+# ✅ Riduci al minimo per diminuire probabilità di blocco
+MAX_CONCURRENCY = 1
 
-# Regex robusta: : o ： e numeri con . o ,
+# ✅ Regex robusta: : o ： e numeri con . o ,
 COUNT_RE = re.compile(r"Totale\s+dei\s+commenti\s*[:：]\s*([0-9][0-9\.,]*)", re.IGNORECASE)
 
 
@@ -84,7 +84,6 @@ def normalize_targets(raw: Any) -> List[Dict[str, str]]:
 
 
 def is_challenge(status: Optional[int], title: str, body_text: str) -> bool:
-    # segnali tipici che hai visto
     if status in (401, 403, 429):
         return True
     t = (title or "").lower()
@@ -150,19 +149,22 @@ async def check_one(context, sem: asyncio.Semaphore, target: Dict[str, str]) -> 
     name = target.get("name", url)
 
     async with sem:
+        # ✅ piccolo delay fisso per evitare “raffica”
+        await asyncio.sleep(1.2)
+
         page = await context.new_page()
         try:
             # 1° tentativo
             status, title, text = await fetch_page_text(page, url)
 
-            # Se challenge: retry 1 volta (pulito, senza trucchi)
+            # retry 1 volta (pulito)
             if is_challenge(status, title, text):
                 await page.close()
                 await asyncio.sleep(2.0)
                 page = await context.new_page()
                 status, title, text = await fetch_page_text(page, url)
 
-            # Se ancora challenge: salva debug e stop
+            # se ancora challenge: salva debug e stop
             if is_challenge(status, title, text):
                 h = sha1_text(url)
                 try:
@@ -180,10 +182,9 @@ async def check_one(context, sem: asyncio.Semaphore, target: Dict[str, str]) -> 
                     "error": f"Challenge/blocco (status={status}, title={title})",
                 }
 
-            # Parsing
+            # parsing
             count, preview = parse_count_and_preview(text)
             if count is None:
-                # salva debug “soft” solo se vuoi (qui lo facciamo)
                 h = sha1_text(url)
                 try:
                     with open(f"debug_parse_{h}.txt", "w", encoding="utf-8") as f:
@@ -241,7 +242,7 @@ async def main() -> int:
             viewport={"width": 1280, "height": 720},
         )
 
-        # blocca risorse pesanti (non bloccare JS)
+        # blocca solo risorse pesanti
         async def route_handler(route):
             rt = route.request.resource_type
             if rt in ("image", "media", "font"):
@@ -295,21 +296,22 @@ async def main() -> int:
     if any_state_change:
         save_json(STATE_FILE, state)
 
-    # ✅ Notifiche (1 sola per tipo)
+    # ✅ Notifiche
     if changes_msgs:
         send_telegram("✅ Cambiamenti rilevati:\n\n" + "\n\n".join(changes_msgs))
 
     if blocked:
         send_telegram(
-            "⛔ Alcune pagine risultano bloccate dalla verifica in questo run:\n"
-            + "\n".join(blocked[:15])
+            "⛔ Blocco Cloudflare rilevato in questo run.\n"
+            f"Pagine bloccate: {len(blocked)}/{len(targets)}\n\n"
+            + "\n".join(blocked[:10])
         )
 
-    # opzionale: se vuoi sapere quando fallisce parsing (pagina 200 ma layout cambiato)
-    if parse_errors:
+    # manda parse_errors solo se non è un run “quasi tutto bloccato”
+    if parse_errors and len(blocked) < len(targets) // 2:
         send_telegram(
-            "⚠️ Alcune pagine non sono parseabili (pagina ok ma layout/testo diverso):\n"
-            + "\n".join(parse_errors[:15])
+            "⚠️ Alcune pagine non sono parseabili (layout/testo diverso):\n"
+            + "\n".join(parse_errors[:10])
         )
 
     print("✅ Fine run.")
