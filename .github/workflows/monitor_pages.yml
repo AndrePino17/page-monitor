@@ -1,4 +1,4 @@
-name: Monitor pages
+name: Monitor pages (selenium)
 
 on:
   workflow_dispatch:
@@ -15,7 +15,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,18 +25,20 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          google-chrome --version || true
 
-      - name: Run monitor
+      - name: Run monitor (selenium)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           PYTHONUNBUFFERED: "1"
         run: |
-          python monitor.py
+          python monitor_selenium.py
 
       - name: Upload debug files
         if: always()
