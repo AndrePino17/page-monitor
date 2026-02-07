@@ -14,12 +14,14 @@ TARGETS_FILE = "targets.json"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Performance / affidabilità
-NAV_TIMEOUT_MS = 25_000
-EXTRA_WAIT_MS = 250
-MAX_CONCURRENCY = 3  # alza a 4-5 solo se non viene bloccato
+NAV_TIMEOUT_MS = 35_000
+EXTRA_WAIT_MS = 1200
 
-COUNT_RE = re.compile(r"Totale\s+dei\s+commenti\s*:\s*(\d+)", re.IGNORECASE)
+# ⚠️ Se vedi molti 403, metti 1. Se regge, 2-3.
+MAX_CONCURRENCY = 2
+
+# Regex robusta: : o ： e numeri con . o ,
+COUNT_RE = re.compile(r"Totale\s+dei\s+commenti\s*[:：]\s*([0-9][0-9\.,]*)", re.IGNORECASE)
 
 
 def load_json(path: str, default):
@@ -47,7 +49,7 @@ def send_telegram(message: str) -> bool:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False}
     try:
         r = requests.post(url, data=payload, timeout=20)
         if r.status_code != 200:
@@ -60,19 +62,13 @@ def send_telegram(message: str) -> bool:
 
 
 def normalize_targets(raw: Any) -> List[Dict[str, str]]:
-    """
-    Accetta:
-    - lista di stringhe URL
-    - lista di oggetti {name,type,url}
-    Ritorna sempre lista di dict con almeno url e name.
-    """
     out: List[Dict[str, str]] = []
     if not isinstance(raw, list):
         return out
 
     for item in raw:
         if isinstance(item, str):
-            out.append({"name": item, "type": "unknown", "url": item})
+            out.append({"name": item, "type": "investing_member_comments", "url": item})
         elif isinstance(item, dict):
             url = str(item.get("url", "")).strip()
             if not url:
@@ -80,31 +76,40 @@ def normalize_targets(raw: Any) -> List[Dict[str, str]]:
             out.append(
                 {
                     "name": str(item.get("name") or url).strip(),
-                    "type": str(item.get("type") or "unknown").strip(),
+                    "type": str(item.get("type") or "investing_member_comments").strip(),
                     "url": url,
                 }
             )
     return out
 
 
-def parse_investing_count_and_first(body_text: str) -> Tuple[Optional[int], Optional[str]]:
-    """
-    Dal testo della pagina (innerText) estrae:
-    - Totale dei commenti: N
-    - primo commento (preview): prende la prima riga "di contenuto" dopo l’intestazione.
-    """
+def is_challenge(status: Optional[int], title: str, body_text: str) -> bool:
+    # segnali tipici che hai visto
+    if status in (401, 403, 429):
+        return True
+    t = (title or "").lower()
+    b = (body_text or "").lower()
+    if "ci siamo quasi" in t:
+        return True
+    if "cloudflare" in b and ("ray id" in b or "utente umano" in b or "controllo aggiuntivo" in b):
+        return True
+    return False
+
+
+def parse_count_and_preview(body_text: str) -> Tuple[Optional[int], Optional[str]]:
     m = COUNT_RE.search(body_text)
-    count = int(m.group(1)) if m else None
+    count = None
+    if m:
+        raw = m.group(1).replace(".", "").replace(",", "")
+        try:
+            count = int(raw)
+        except:
+            count = None
 
-    # Ricava primo commento in modo semplice:
-    # dopo "Commenti di" la struttura è spesso:
-    # [strumento]
-    # [tempo]
-    # [testo commento]
+    # preview “semplice”
     lines = [x.strip() for x in body_text.splitlines() if x.strip()]
-    first_comment = None
+    preview = None
 
-    # trova indice "Commenti di"
     idx = -1
     for i, line in enumerate(lines):
         if line.lower().startswith("commenti di"):
@@ -112,43 +117,120 @@ def parse_investing_count_and_first(body_text: str) -> Tuple[Optional[int], Opti
             break
 
     if idx != -1:
-        # scorri le righe successive e prendi la prima che NON è tempo e NON è un titolo/strumento "ovvio"
-        time_re = re.compile(r"(\d+\s+(minuti|minuto|ore|ora|giorni|giorno)\s+fa)|(\d{2}\.\d{2}\.\d{4})", re.IGNORECASE)
+        time_re = re.compile(
+            r"(\d+\s+(minuti|minuto|ore|ora|giorni|giorno)\s+fa)|(\d{2}\.\d{2}\.\d{4})",
+            re.IGNORECASE,
+        )
         skip_re = re.compile(r"^(commenti|guida sui commenti|statistiche dell)", re.IGNORECASE)
 
-        # euristica: il commento vero di solito è una riga "normale" non troppo corta
-        for j in range(idx + 1, min(idx + 40, len(lines))):
+        for j in range(idx + 1, min(idx + 80, len(lines))):
             s = lines[j]
-            if skip_re.search(s):
+            if skip_re.search(s) or time_re.search(s):
                 continue
-            if time_re.search(s):
+            if len(s) <= 2:
                 continue
-            # spesso la riga "strumento" è molto breve, tipo "Banco Bpm" (2 parole),
-            # mentre il commento può essere corto ma ha più contenuto. Non facciamo i fenomeni:
-            # prendiamo la prima riga che non sia chiaramente un header/tempo.
-            # Però scartiamo cose troppo "titolo" (solo lettere/spazi e <= 25 char) UNA VOLTA.
-            if re.fullmatch(r"[A-Za-zÀ-ÿ0-9 .&'\-]+", s) and len(s) <= 25:
-                # probabile titolo asset: skip 1 titolo e continua
-                continue
-
-            first_comment = s
+            preview = s
             break
 
-    return count, first_comment
+    return count, preview
 
 
-async def fetch_text(page, url: str) -> str:
-    await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+async def fetch_page_text(page, url: str) -> Tuple[Optional[int], str, str]:
+    resp = await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     await page.wait_for_timeout(EXTRA_WAIT_MS)
-    return await page.evaluate("() => document.body ? document.body.innerText : ''")
+
+    status = resp.status if resp else None
+    title = await page.title()
+    text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+    return status, title, text
 
 
-async def check_one(browser, target: Dict[str, str], sem: asyncio.Semaphore) -> Dict[str, Any]:
+async def check_one(context, sem: asyncio.Semaphore, target: Dict[str, str]) -> Dict[str, Any]:
     url = target["url"]
     name = target.get("name", url)
-    ttype = target.get("type", "unknown")
 
     async with sem:
+        page = await context.new_page()
+        try:
+            # 1° tentativo
+            status, title, text = await fetch_page_text(page, url)
+
+            # Se challenge: retry 1 volta (pulito, senza trucchi)
+            if is_challenge(status, title, text):
+                await page.close()
+                await asyncio.sleep(2.0)
+                page = await context.new_page()
+                status, title, text = await fetch_page_text(page, url)
+
+            # Se ancora challenge: salva debug e stop
+            if is_challenge(status, title, text):
+                h = sha1_text(url)
+                try:
+                    await page.screenshot(path=f"debug_cf_{h}.png", full_page=True)
+                    html = await page.content()
+                    with open(f"debug_cf_{h}.html", "w", encoding="utf-8") as f:
+                        f.write(html)
+                except:
+                    pass
+
+                return {
+                    "ok": False,
+                    "url": url,
+                    "name": name,
+                    "error": f"Challenge/blocco (status={status}, title={title})",
+                }
+
+            # Parsing
+            count, preview = parse_count_and_preview(text)
+            if count is None:
+                # salva debug “soft” solo se vuoi (qui lo facciamo)
+                h = sha1_text(url)
+                try:
+                    with open(f"debug_parse_{h}.txt", "w", encoding="utf-8") as f:
+                        f.write(text[:20000])
+                except:
+                    pass
+
+                return {
+                    "ok": False,
+                    "url": url,
+                    "name": name,
+                    "error": f"Pagina ok ma non trovo 'Totale dei commenti' (status={status}, title={title})",
+                }
+
+            return {
+                "ok": True,
+                "url": url,
+                "name": name,
+                "count": count,
+                "preview": preview,
+            }
+
+        except PWTimeoutError:
+            return {"ok": False, "url": url, "name": name, "error": "Timeout"}
+        except Exception as e:
+            return {"ok": False, "url": url, "name": name, "error": str(e)}
+        finally:
+            try:
+                await page.close()
+            except:
+                pass
+
+
+async def main() -> int:
+    raw_targets = load_json(TARGETS_FILE, [])
+    targets = normalize_targets(raw_targets)
+    if not targets:
+        print("❌ targets.json vuoto/non valido.")
+        return 1
+
+    state: Dict[str, Any] = load_json(STATE_FILE, {})
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+
+        # ✅ CONTEXT UNICO = cookie/session riusati tra URL
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -159,131 +241,78 @@ async def check_one(browser, target: Dict[str, str], sem: asyncio.Semaphore) -> 
             viewport={"width": 1280, "height": 720},
         )
 
-        # blocca roba pesante (speed)
-        await context.route(
-            "**/*",
-            lambda route, req: asyncio.create_task(
-                route.abort()
-                if req.resource_type in ("image", "media", "font", "stylesheet")
-                else route.continue_()
-            ),
-        )
+        # blocca risorse pesanti (non bloccare JS)
+        async def route_handler(route):
+            rt = route.request.resource_type
+            if rt in ("image", "media", "font"):
+                await route.abort()
+            else:
+                await route.continue_()
 
-        page = await context.new_page()
+        await context.route("**/*", route_handler)
 
-        try:
-            body_text = await fetch_text(page, url)
+        results = await asyncio.gather(*(check_one(context, sem, t) for t in targets))
 
-            if ttype == "investing_member_comments":
-                count, first_comment = parse_investing_count_and_first(body_text)
-                await context.close()
-                return {
-                    "ok": count is not None,
-                    "type": ttype,
-                    "url": url,
-                    "name": name,
-                    "count": count,
-                    "first_comment": first_comment,
-                    "error": None if count is not None else "Impossibile leggere 'Totale dei commenti' (pattern non trovato).",
-                }
-
-            # fallback: full page hash (per test.html)
-            h = sha1_text(body_text)
-            await context.close()
-            return {
-                "ok": True,
-                "type": "full_page_hash",
-                "url": url,
-                "name": name,
-                "hash": h,
-                "error": None,
-            }
-
-        except PWTimeoutError:
-            await context.close()
-            return {"ok": False, "type": ttype, "url": url, "name": name, "error": "Timeout caricamento pagina."}
-        except Exception as e:
-            await context.close()
-            return {"ok": False, "type": ttype, "url": url, "name": name, "error": f"Errore: {e}"}
-
-
-async def main() -> int:
-    raw_targets = load_json(TARGETS_FILE, [])
-    targets = normalize_targets(raw_targets)
-
-    if not targets:
-        print("❌ targets.json vuoto o non valido.")
-        return 1
-
-    state: Dict[str, Any] = load_json(STATE_FILE, {})
-
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        results = await asyncio.gather(*(check_one(browser, t, sem) for t in targets))
+        await context.close()
         await browser.close()
 
     changes_msgs: List[str] = []
+    blocked: List[str] = []
+    parse_errors: List[str] = []
     any_state_change = False
 
     for r in results:
-        print(f"Controllo: {r.get('name')} -> {r.get('url')}")
-
         if not r.get("ok"):
-            print(f"  ❌ {r.get('error')}")
+            err = r.get("error", "errore sconosciuto")
+            print("❌", r.get("name"), err)
+            if "Challenge/blocco" in err:
+                blocked.append(f"- {r.get('name')} | {r.get('url')}")
+            else:
+                parse_errors.append(f"- {r.get('name')} | {err}")
             continue
 
         url = r["url"]
-        prev = state.get(url, {})
+        name = r.get("name", url)
+        new_count = r.get("count")
+        prev_count = state.get(url, {}).get("count")
 
-        if r["type"] == "investing_member_comments":
-            new_count = r.get("count")
-            prev_count = prev.get("count")
+        state[url] = {
+            "type": "investing_member_comments",
+            "count": new_count,
+            "preview": r.get("preview"),
+            "name": name,
+        }
+        any_state_change = True
 
-            # salva stato SEMPRE se leggiamo
-            state[url] = {
-                "type": "investing_member_comments",
-                "count": new_count,
-                "first_comment_hash": sha1_text(r["first_comment"]) if r.get("first_comment") else None,
-                "first_comment_preview": r.get("first_comment"),
-                "name": r.get("name"),
-            }
-            any_state_change = True
-
-            if isinstance(prev_count, int) and isinstance(new_count, int) and new_count > prev_count:
-                changes_msgs.append(
-                    f"📈 {r.get('name')}\n"
-                    f"Totale commenti: {prev_count} → {new_count}\n"
-                    f"URL: {url}\n"
-                    f"Ultimo commento (preview): {r.get('first_comment') or '(non letto)'}"
-                )
-                print(f"  ✅ AUMENTO: {prev_count} -> {new_count}")
-            else:
-                print(f"  - ok, totale={new_count} (prima={prev_count})")
-
-        else:
-            # full_page_hash
-            new_hash = r.get("hash")
-            prev_hash = prev.get("hash")
-            state[url] = {"type": "full_page_hash", "hash": new_hash, "name": r.get("name")}
-            any_state_change = True
-
-            if prev_hash and new_hash and new_hash != prev_hash:
-                changes_msgs.append(f"🔔 Cambiamento pagina: {r.get('name')}\nURL: {url}")
-                print("  ✅ CAMBIAMENTO HASH")
-            else:
-                print("  - ok (hash invariato o primo run)")
+        if isinstance(prev_count, int) and isinstance(new_count, int) and new_count > prev_count:
+            changes_msgs.append(
+                f"📈 {name}\n"
+                f"Totale commenti: {prev_count} → {new_count}\n"
+                f"URL: {url}\n"
+                f"Preview: {r.get('preview') or '(n/a)'}"
+            )
 
     if any_state_change:
         save_json(STATE_FILE, state)
 
+    # ✅ Notifiche (1 sola per tipo)
     if changes_msgs:
-        msg = "✅ Cambiamenti rilevati:\n\n" + "\n\n".join(changes_msgs)
-        send_telegram(msg)
-    else:
-        print("Nessun cambiamento rilevato -> nessuna notifica.")
+        send_telegram("✅ Cambiamenti rilevati:\n\n" + "\n\n".join(changes_msgs))
 
+    if blocked:
+        send_telegram(
+            "⛔ Alcune pagine risultano bloccate dalla verifica in questo run:\n"
+            + "\n".join(blocked[:15])
+        )
+
+    # opzionale: se vuoi sapere quando fallisce parsing (pagina 200 ma layout cambiato)
+    if parse_errors:
+        send_telegram(
+            "⚠️ Alcune pagine non sono parseabili (pagina ok ma layout/testo diverso):\n"
+            + "\n".join(parse_errors[:15])
+        )
+
+    print("✅ Fine run.")
     return 0
 
 
