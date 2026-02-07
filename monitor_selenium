@@ -1,0 +1,246 @@
+import os
+import re
+import json
+import time
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
+STATE_FILE = "state.json"
+TARGETS_FILE = "targets.json"
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+PAGE_LOAD_TIMEOUT = 35
+EXTRA_WAIT_SEC = 1.2
+RETRY_BACKOFF = [0, 5, 15]   # retry puliti
+DELAY_BETWEEN_URLS = 1.2
+
+COUNT_RE = re.compile(r"Totale\s+dei\s+commenti\s*[:：]\s*([0-9][0-9\.,]*)", re.IGNORECASE)
+
+
+def load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def sha1_text(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def send_telegram(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram non configurato.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": False}
+    try:
+        r = requests.post(url, data=payload, timeout=20)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def normalize_targets(raw: Any) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, str):
+            out.append({"name": item, "type": "investing_member_comments", "url": item})
+        elif isinstance(item, dict):
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            out.append(
+                {
+                    "name": str(item.get("name") or url).strip(),
+                    "type": str(item.get("type") or "investing_member_comments").strip(),
+                    "url": url,
+                }
+            )
+    return out
+
+
+def is_challenge(title: str, body_text: str) -> bool:
+    t = (title or "").lower()
+    b = (body_text or "").lower()
+    if "ci siamo quasi" in t:
+        return True
+    if "cloudflare" in b and ("ray id" in b or "utente umano" in b or "controllo aggiuntivo" in b):
+        return True
+    return False
+
+
+def parse_count_and_preview(body_text: str) -> Tuple[Optional[int], Optional[str]]:
+    m = COUNT_RE.search(body_text)
+    count = None
+    if m:
+        raw = m.group(1).replace(".", "").replace(",", "")
+        try:
+            count = int(raw)
+        except:
+            count = None
+
+    lines = [x.strip() for x in body_text.splitlines() if x.strip()]
+    preview = None
+    idx = -1
+    for i, line in enumerate(lines):
+        if line.lower().startswith("commenti di"):
+            idx = i
+            break
+    if idx != -1:
+        for j in range(idx + 1, min(idx + 80, len(lines))):
+            s = lines[j]
+            if len(s) <= 2:
+                continue
+            preview = s
+            break
+
+    return count, preview
+
+
+def make_driver() -> webdriver.Chrome:
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1280,720")
+    opts.add_argument("--lang=it-IT")
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
+
+
+def fetch_page(driver: webdriver.Chrome, url: str) -> Tuple[str, str]:
+    driver.get(url)
+    time.sleep(EXTRA_WAIT_SEC)
+    title = driver.title or ""
+    text = driver.find_element("tag name", "body").text or ""
+    return title, text
+
+
+def save_debug(driver: webdriver.Chrome, prefix: str, url: str):
+    h = sha1_text(url)
+    try:
+        driver.save_screenshot(f"{prefix}_{h}.png")
+    except:
+        pass
+    try:
+        html = driver.page_source
+        with open(f"{prefix}_{h}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except:
+        pass
+
+
+def main() -> int:
+    targets = normalize_targets(load_json(TARGETS_FILE, []))
+    if not targets:
+        print("targets.json vuoto/non valido.")
+        return 1
+
+    state: Dict[str, Any] = load_json(STATE_FILE, {})
+    driver = make_driver()
+
+    changes = []
+    blocked = []
+    parse_errors = []
+
+    try:
+        for t in targets:
+            name, url = t["name"], t["url"]
+            time.sleep(DELAY_BETWEEN_URLS)
+
+            title, text = "", ""
+            ok = False
+
+            for wait_s in RETRY_BACKOFF:
+                if wait_s:
+                    time.sleep(wait_s)
+                try:
+                    title, text = fetch_page(driver, url)
+                except TimeoutException:
+                    continue
+                except WebDriverException:
+                    continue
+
+                if not is_challenge(title, text):
+                    ok = True
+                    break
+
+            if not ok:
+                blocked.append(f"- {name} | {url}")
+                save_debug(driver, "debug_cf", url)
+                continue
+
+            count, preview = parse_count_and_preview(text)
+            if count is None:
+                parse_errors.append(f"- {name} | non trovo 'Totale dei commenti' (title={title})")
+                # salva testo per debug
+                h = sha1_text(url)
+                with open(f"debug_parse_{h}.txt", "w", encoding="utf-8") as f:
+                    f.write(text[:20000])
+                continue
+
+            prev_count = state.get(url, {}).get("count")
+            state[url] = {"count": count, "preview": preview, "name": name}
+
+            if isinstance(prev_count, int) and count > prev_count:
+                changes.append((name, url, prev_count, count, preview))
+
+    finally:
+        driver.quit()
+
+    save_json(STATE_FILE, state)
+
+    if changes:
+        msg = "✅ Cambiamenti rilevati:\n\n" + "\n\n".join(
+            [f"📈 {n}\nTotale: {pc} → {nc}\n{u}\nPreview: {pv or '(n/a)'}"
+             for (n, u, pc, nc, pv) in changes]
+        )
+        send_telegram(msg)
+
+    if blocked:
+        send_telegram(
+            "⛔ Blocco Cloudflare rilevato in questo run.\n"
+            f"Pagine bloccate: {len(blocked)}/{len(targets)}\n\n"
+            + "\n".join(blocked[:10])
+        )
+
+    if parse_errors and len(blocked) < len(targets) // 2:
+        send_telegram(
+            "⚠️ Alcune pagine non sono parseabili:\n" + "\n".join(parse_errors[:10])
+        )
+
+    print("Fine run.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
